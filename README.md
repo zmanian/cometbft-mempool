@@ -161,3 +161,28 @@ By the time a cluster's proposer slot starts, stream connections have already be
 - The new proposer cluster can immediately receive transactions.
 - Intra-cluster failover doesn't disrupt stream connections.
 - The connection establishment bottleneck is eliminated.
+
+## CometBFT Fork: ProposerOracle Interface
+
+We have implemented the proposer-aware routing concept directly in a fork of CometBFT's Go codebase: [zmanian/cometbft](https://github.com/zmanian/cometbft/tree/feature/proposer-aware-mempool).
+
+### Changes
+
+**New: `mempool/proposer_schedule.go`** -- `ProposerOracle` interface exposing the proposer schedule to the mempool reactor:
+- `ProposerAt(height, round)` -- compute proposer for any height/round
+- `UpcomingProposers(height, n)` -- next N proposers
+- `IsUpcomingProposer(addr, lookahead)` -- check if a peer is an upcoming proposer
+- `CurrentHeight()` / `CurrentRound()` -- current consensus position
+
+**New: `mempool/proposer_oracle_impl.go`** -- `ValidatorSetOracle` wrapping CometBFT's `types.ValidatorSet` with thread-safe state updates. Uses `CopyIncrementProposerPriority` to compute proposers on copies without mutating the original validator set.
+
+**Modified: `mempool/reactor.go`** -- Soft priority routing in `broadcastTxRoutine`: when the oracle is set, non-proposer peers receive a 50ms delay per transaction. All peers still receive all transactions (safety preserved). Fully backward compatible -- `nil` oracle preserves existing flood behavior.
+
+**Modified: `node/node.go`** -- Wires the oracle from `state.Validators` at node initialization for the flood mempool type.
+
+### Design Decisions
+
+1. **Soft priority, not hard filter**: Non-proposer peers are delayed 50ms, not blocked. This preserves CometBFT's safety invariant that all peers eventually receive all transactions.
+2. **Peer-to-validator resolver**: P2P node keys differ from validator addresses in CometBFT. A separate `peerToValidator` function maps between them, injectable based on deployment topology.
+3. **Zero new dependencies**: Only uses existing CometBFT packages.
+4. **All existing tests pass**: `go test ./mempool/...` and `go vet` clean.
