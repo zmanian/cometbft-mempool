@@ -2,12 +2,14 @@
 
 mod leader;
 mod mempool;
+mod schedule;
 mod types;
 
 use {
     futures::{SinkExt, StreamExt},
     mempool::{MempoolCommand, MempoolQuery, MempoolQueryResult, MempoolStateMachine},
     mosaik::{*, discovery::PeerEntry, primitives::Tag},
+    schedule::ValidatorSchedule,
     types::Transaction,
 };
 
@@ -89,13 +91,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("validator group online, leader: {leader_id}");
 
     // --- Spawn leader-tracking tasks on each validator ---
-    // These tasks update the "proposer" tag when leadership changes.
+    // These tasks update the "proposer" tag when leadership changes (Raft-based).
     tokio::spawn({
         let discovery = validator0.discovery().clone();
         let secret_key = validator0.local().secret_key().clone();
         let when = g0.when().clone();
         async move {
-            if let Err(e) = leader::track_leader(discovery, secret_key, when).await {
+            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
                 tracing::error!("leader tracker 0 failed: {e}");
             }
         }
@@ -106,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         let secret_key = validator1.local().secret_key().clone();
         let when = g1.when().clone();
         async move {
-            if let Err(e) = leader::track_leader(discovery, secret_key, when).await {
+            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
                 tracing::error!("leader tracker 1 failed: {e}");
             }
         }
@@ -117,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
         let secret_key = validator2.local().secret_key().clone();
         let when = g2.when().clone();
         async move {
-            if let Err(e) = leader::track_leader(discovery, secret_key, when).await {
+            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
                 tracing::error!("leader tracker 2 failed: {e}");
             }
         }
@@ -464,17 +466,142 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("follower g1 sees {count} pending transactions (consistent with leader)");
     }
 
-    // In a production system, tx sources would use subscribe_if with the
-    // "proposer" tag to route transactions only to the current leader:
-    //
-    //   let proposer_tag = Tag::from("proposer");
-    //   let consumer = network.streams()
-    //       .consumer::<Transaction>()
-    //       .subscribe_if(move |peer: &PeerEntry| peer.tags().contains(&proposer_tag))
-    //       .build();
-    //
-    // Mosaik's dynamic predicate re-evaluation would automatically re-route
-    // when leadership changes and the "proposer" tag moves to a new node.
+    // =========================================================================
+    // Phase 6: Pipeline Pre-Connection for Fast BFT Rotation
+    // =========================================================================
+    tracing::info!("--- Phase 6: Pipeline Pre-Connection Demo ---");
+    tracing::info!(
+        "Problem: reactive tag updates take 100-400ms, too slow for 500ms slot rotation"
+    );
+    tracing::info!(
+        "Solution: deterministic schedule allows pre-tagging upcoming proposers"
+    );
+
+    // Create a ValidatorSchedule from the 3 validator PeerIds with equal
+    // voting power and 500ms slots
+    let slot_duration = std::time::Duration::from_millis(500);
+    let validator_set = vec![
+        (validator0.local().id(), 1),
+        (validator1.local().id(), 1),
+        (validator2.local().id(), 1),
+    ];
+
+    let schedule = ValidatorSchedule::new(validator_set.clone(), slot_duration);
+
+    // Show the pre-computed schedule for the next 10 slots
+    tracing::info!("pre-computed proposer schedule (next 10 slots):");
+    let upcoming = schedule.upcoming_proposers(10);
+    for (slot, proposer) in &upcoming {
+        // Determine which validator index this proposer is
+        let validator_idx = if *proposer == validator0.local().id() {
+            0
+        } else if *proposer == validator1.local().id() {
+            1
+        } else {
+            2
+        };
+        tracing::info!("  slot {slot}: validator{validator_idx} ({proposer})");
+    }
+
+    // Spawn schedule-aware leader trackers on each validator.
+    // Each validator independently computes the same schedule and pre-tags itself.
+    let schedule0 = ValidatorSchedule::new(validator_set.clone(), slot_duration);
+    tokio::spawn({
+        let discovery = validator0.discovery().clone();
+        let secret_key = validator0.local().secret_key().clone();
+        let local_id = validator0.local().id();
+        async move {
+            if let Err(e) =
+                leader::track_leader_scheduled(schedule0, discovery, secret_key, local_id).await
+            {
+                tracing::error!("scheduled tracker 0 failed: {e}");
+            }
+        }
+    });
+
+    let schedule1 = ValidatorSchedule::new(validator_set.clone(), slot_duration);
+    tokio::spawn({
+        let discovery = validator1.discovery().clone();
+        let secret_key = validator1.local().secret_key().clone();
+        let local_id = validator1.local().id();
+        async move {
+            if let Err(e) =
+                leader::track_leader_scheduled(schedule1, discovery, secret_key, local_id).await
+            {
+                tracing::error!("scheduled tracker 1 failed: {e}");
+            }
+        }
+    });
+
+    let schedule2 = ValidatorSchedule::new(validator_set, slot_duration);
+    tokio::spawn({
+        let discovery = validator2.discovery().clone();
+        let secret_key = validator2.local().secret_key().clone();
+        let local_id = validator2.local().id();
+        async move {
+            if let Err(e) =
+                leader::track_leader_scheduled(schedule2, discovery, secret_key, local_id).await
+            {
+                tracing::error!("scheduled tracker 2 failed: {e}");
+            }
+        }
+    });
+
+    // Wait for 3 slot rotations (1.5s) to observe pre-tagging in action
+    tracing::info!("waiting for 3 slot rotations (1.5s) to observe pipeline pre-tagging...");
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+
+    // Verify tags: show which validators currently have proposer-related tags
+    tracing::info!("current proposer tags after pipeline pre-connection:");
+    let tag_proposer = Tag::from(leader::TAG_PROPOSER);
+    let tag_next = Tag::from(leader::TAG_PROPOSER_NEXT);
+    let tag_soon = Tag::from(leader::TAG_PROPOSER_SOON);
+    let tag_labels: [(Tag, &str); 3] = [
+        (tag_proposer, "proposer"),
+        (tag_next, "proposer-next"),
+        (tag_soon, "proposer-soon"),
+    ];
+    for (i, validator) in [&validator0, &validator1, &validator2]
+        .iter()
+        .enumerate()
+    {
+        let me: PeerEntry = validator.discovery().me().into_unsigned();
+        let tags: Vec<&str> = tag_labels
+            .iter()
+            .filter(|(t, _)| me.tags().contains(t))
+            .map(|(_, label)| *label)
+            .collect();
+        if !tags.is_empty() {
+            tracing::info!("  validator{i}: {}", tags.join(", "));
+        }
+    }
+
+    // Demonstrate how tx-source consumers would use broader predicates to
+    // pre-connect to current + upcoming proposers
+    tracing::info!("pipeline subscribe_if predicate example:");
+    tracing::info!("  consumers match on 'proposer' OR 'proposer-next' OR 'proposer-soon'");
+    tracing::info!(
+        "  this gives up to 1000ms lead time (2 slots) for stream pre-warming"
+    );
+
+    let proposer_tag = Tag::from(leader::TAG_PROPOSER);
+    let next_tag = Tag::from(leader::TAG_PROPOSER_NEXT);
+    let soon_tag = Tag::from(leader::TAG_PROPOSER_SOON);
+    let _pipeline_consumer = tx_source_a
+        .streams()
+        .consumer::<Transaction>()
+        .subscribe_if(move |peer: &PeerEntry| {
+            peer.tags().contains(&proposer_tag)
+                || peer.tags().contains(&next_tag)
+                || peer.tags().contains(&soon_tag)
+        })
+        .build();
+
+    tracing::info!("pipeline consumer created with 3-tier proposer predicate");
+    tracing::info!(
+        "benefit: by the time a validator's slot starts, \
+         stream connections are already established"
+    );
 
     tracing::info!("cometbft mempool example complete");
     Ok(())

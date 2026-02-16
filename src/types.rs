@@ -22,6 +22,14 @@ impl Transaction {
     }
 }
 
+/// Information about a proposer slot in the deterministic schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct SlotInfo {
+    pub slot: u64,
+    pub proposer: String,
+}
+
 /// A block proposed by the current leader containing pending transactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedBlock {
