@@ -2,6 +2,7 @@ use {mosaik::PeerId, std::time::Duration};
 
 /// Information about a validator participating in the proposer schedule.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ValidatorState {
     peer_id: PeerId,
     voting_power: u64,
@@ -17,12 +18,14 @@ struct ValidatorState {
 /// Because the algorithm is deterministic, every node can independently compute
 /// the proposer for any slot without communication.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidatorSchedule {
     validators: Vec<ValidatorState>,
     slot_duration: Duration,
     start_time: tokio::time::Instant,
 }
 
+#[allow(dead_code)]
 impl ValidatorSchedule {
     /// Create a new schedule from a list of (PeerId, voting_power) pairs.
     ///

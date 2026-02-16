@@ -6,6 +6,7 @@ use {
         groups::When,
         primitives::Tag,
     },
+    std::time::Duration,
 };
 
 /// Tags for pipeline pre-connection:
@@ -74,6 +75,7 @@ pub async fn track_leader_raft(
 ///
 /// Tags are applied/removed accordingly, and stream consumers that match on
 /// any of these tags will pre-connect to upcoming proposers.
+#[allow(dead_code)]
 pub async fn track_leader_scheduled(
     schedule: ValidatorSchedule,
     discovery: Discovery,
@@ -135,5 +137,82 @@ pub async fn track_leader_scheduled(
 
         let signed = updated.sign(&secret_key)?;
         discovery.feed(signed);
+    }
+}
+
+/// Cluster-aware proposer tracking with pipeline pre-connection.
+///
+/// Instead of tracking proposer status per individual node, this function
+/// manages proposer tags for entire validator clusters. When a cluster is
+/// the current proposer, ALL nodes in that cluster get the "proposer" tag.
+/// This provides stream stability: tx source connections survive intra-cluster
+/// Raft failover because all cluster members carry the same tags.
+///
+/// Each inner `Vec<(Discovery, SecretKey)>` represents the nodes in one
+/// validator cluster. The schedule uses simple round-robin by cluster index.
+///
+/// The `cluster_names` parameter provides human-readable names for logging.
+pub async fn track_proposer_clusters(
+    cluster_handles: Vec<Vec<(Discovery, SecretKey)>>,
+    cluster_names: Vec<String>,
+    slot_duration: Duration,
+    num_clusters: usize,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(slot_duration);
+    let mut current_slot: u64 = 0;
+    let mut first_tick = true;
+
+    loop {
+        interval.tick().await;
+
+        if first_tick {
+            first_tick = false;
+            // First tick fires immediately, treat as slot 0
+        } else {
+            current_slot += 1;
+        }
+
+        let current_idx = (current_slot as usize) % num_clusters;
+        let next_idx = ((current_slot + 1) as usize) % num_clusters;
+        let soon_idx = ((current_slot + 2) as usize) % num_clusters;
+
+        tracing::info!(
+            slot = current_slot,
+            proposer = %cluster_names[current_idx],
+            next = %cluster_names[next_idx],
+            soon = %cluster_names[soon_idx],
+            "cluster slot transition"
+        );
+
+        // Update tags for each cluster
+        for (cluster_idx, handles) in cluster_handles.iter().enumerate() {
+            let is_proposer = cluster_idx == current_idx;
+            let is_next = cluster_idx == next_idx;
+            let is_soon = cluster_idx == soon_idx;
+
+            for (discovery, secret_key) in handles {
+                let entry: PeerEntry = discovery.me().into_unsigned();
+                let mut updated = entry;
+
+                // Remove all proposer-related tags first
+                for tag_str in &PROPOSER_TAGS {
+                    updated = updated.remove_tags(Tag::from(*tag_str));
+                }
+
+                // Add back applicable tags
+                if is_proposer {
+                    updated = updated.add_tags(Tag::from(TAG_PROPOSER));
+                }
+                if is_next {
+                    updated = updated.add_tags(Tag::from(TAG_PROPOSER_NEXT));
+                }
+                if is_soon {
+                    updated = updated.add_tags(Tag::from(TAG_PROPOSER_SOON));
+                }
+
+                let signed = updated.sign(secret_key)?;
+                discovery.feed(signed);
+            }
+        }
     }
 }

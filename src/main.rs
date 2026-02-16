@@ -1,15 +1,16 @@
 #![allow(clippy::too_many_lines)]
 
+mod cluster;
 mod leader;
 mod mempool;
 mod schedule;
 mod types;
 
 use {
+    cluster::ValidatorCluster,
     futures::{SinkExt, StreamExt},
-    mempool::{MempoolCommand, MempoolQuery, MempoolQueryResult, MempoolStateMachine},
-    mosaik::{*, discovery::PeerEntry, primitives::Tag},
-    schedule::ValidatorSchedule,
+    mempool::{MempoolCommand, MempoolQuery, MempoolQueryResult},
+    mosaik::{discovery::PeerEntry, primitives::Tag, *},
     types::Transaction,
 };
 
@@ -23,161 +24,154 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let network_id = NetworkId::random();
-    let group_key = GroupKey::random();
 
     // Configuration: max 10 txs per block, max 200,000 gas per block
     let max_block_size: usize = 10;
     let max_block_gas: u64 = 200_000;
 
-    // --- Create 3 validator nodes with "validator" tag ---
-    tracing::info!("creating validator nodes...");
-    let validator0 = Network::builder(network_id)
-        .with_discovery(
-            mosaik::discovery::Config::builder().with_tags(Tag::from("validator")),
-        )
-        .build()
-        .await?;
+    // =========================================================================
+    // Phase 1: Create 3 validator clusters (3 nodes each = 9 total)
+    // =========================================================================
+    tracing::info!("--- Phase 1: Creating validator clusters (3 clusters x 3 nodes = 9 nodes) ---");
 
-    let validator1 = Network::builder(network_id)
-        .with_discovery(
-            mosaik::discovery::Config::builder().with_tags(Tag::from("validator")),
-        )
-        .build()
-        .await?;
+    // Each cluster gets its own GroupKey (independent intra-cluster Raft)
+    let cluster_a =
+        ValidatorCluster::new("a", 3, network_id, GroupKey::random(), max_block_size, max_block_gas)
+            .await?;
+    tracing::info!("cluster A created (3 nodes, tag: validator-a)");
 
-    let validator2 = Network::builder(network_id)
-        .with_discovery(
-            mosaik::discovery::Config::builder().with_tags(Tag::from("validator")),
-        )
-        .build()
-        .await?;
+    let cluster_b =
+        ValidatorCluster::new("b", 3, network_id, GroupKey::random(), max_block_size, max_block_gas)
+            .await?;
+    tracing::info!("cluster B created (3 nodes, tag: validator-b)");
 
-    // Cross-discover all validators
-    tracing::info!("cross-discovering validators...");
-    discover_all([&validator0, &validator1, &validator2]).await?;
+    let cluster_c =
+        ValidatorCluster::new("c", 3, network_id, GroupKey::random(), max_block_size, max_block_gas)
+            .await?;
+    tracing::info!("cluster C created (3 nodes, tag: validator-c)");
 
-    // --- All validators join the same Raft group ---
-    // NOTE: In real CometBFT, each node maintains its own independent mempool
-    // and transactions propagate via gossip flooding. Our Raft-replicated mempool
-    // is a deliberate design choice that trades higher latency for stronger
-    // consistency: all validators see the same ordered transaction set.
-    let g0 = validator0
-        .groups()
-        .with_key(group_key)
-        .with_state_machine(MempoolStateMachine::new(max_block_size, max_block_gas))
-        .join();
+    // =========================================================================
+    // Phase 2: Cross-discover all clusters
+    // =========================================================================
+    tracing::info!("--- Phase 2: Cross-discovering clusters ---");
+    cluster_a.discover_cluster(&cluster_b).await?;
+    cluster_a.discover_cluster(&cluster_c).await?;
+    cluster_b.discover_cluster(&cluster_c).await?;
+    tracing::info!("all clusters cross-discovered");
 
-    let g1 = validator1
-        .groups()
-        .with_key(group_key)
-        .with_state_machine(MempoolStateMachine::new(max_block_size, max_block_gas))
-        .join();
+    // =========================================================================
+    // Phase 3: Wait for all clusters to come online
+    // =========================================================================
+    tracing::info!("--- Phase 3: Waiting for all clusters to come online ---");
+    cluster_a.wait_online().await;
+    tracing::info!("cluster A online");
+    cluster_b.wait_online().await;
+    tracing::info!("cluster B online");
+    cluster_c.wait_online().await;
+    tracing::info!("cluster C online");
+    tracing::info!("all 3 validator clusters online (9 nodes total)");
 
-    let g2 = validator2
-        .groups()
-        .with_key(group_key)
-        .with_state_machine(MempoolStateMachine::new(max_block_size, max_block_gas))
-        .join();
-
-    // Wait for the group to come online on all nodes
-    tracing::info!("waiting for validator group to come online...");
-    g0.when().online().await;
-    g1.when().online().await;
-    g2.when().online().await;
-
-    let leader_id = g0
-        .leader()
-        .expect("leader should be elected after online");
-    tracing::info!("validator group online, leader: {leader_id}");
-
-    // --- Spawn leader-tracking tasks on each validator ---
-    // These tasks update the "proposer" tag when leadership changes (Raft-based).
-    tokio::spawn({
-        let discovery = validator0.discovery().clone();
-        let secret_key = validator0.local().secret_key().clone();
-        let when = g0.when().clone();
-        async move {
-            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
-                tracing::error!("leader tracker 0 failed: {e}");
-            }
-        }
-    });
-
-    tokio::spawn({
-        let discovery = validator1.discovery().clone();
-        let secret_key = validator1.local().secret_key().clone();
-        let when = g1.when().clone();
-        async move {
-            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
-                tracing::error!("leader tracker 1 failed: {e}");
-            }
-        }
-    });
-
-    tokio::spawn({
-        let discovery = validator2.discovery().clone();
-        let secret_key = validator2.local().secret_key().clone();
-        let when = g2.when().clone();
-        async move {
-            if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
-                tracing::error!("leader tracker 2 failed: {e}");
-            }
-        }
-    });
-
-    // Give the leader tracker a moment to apply the proposer tag
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Verify that the leader node has the "proposer" tag
-    let proposer_tag = Tag::from("proposer");
-    for (i, validator) in [&validator0, &validator1, &validator2]
-        .iter()
-        .enumerate()
-    {
-        let me: PeerEntry = validator.discovery().me().into_unsigned();
-        if me.tags().contains(&proposer_tag) {
-            tracing::info!("validator{i} has proposer tag (is the leader)");
+    // Log which node is leader in each cluster
+    for (name, cluster) in [("A", &cluster_a), ("B", &cluster_b), ("C", &cluster_c)] {
+        if let Some(idx) = cluster.leader_index() {
+            tracing::info!("cluster {name}: node {idx} is the Raft leader");
         }
     }
 
-    // --- Create 2 tx-source nodes ---
-    tracing::info!("creating tx-source nodes...");
+    // =========================================================================
+    // Phase 4: Set up proposer schedule and tag initial proposer cluster
+    // =========================================================================
+    tracing::info!("--- Phase 4: Setting up proposer schedule ---");
+
+    let clusters = [&cluster_a, &cluster_b, &cluster_c];
+    let cluster_names = ["a", "b", "c"];
+
+    // Cluster A is the initial proposer (slot 0)
+    let initial_proposer_idx = 0;
+    clusters[initial_proposer_idx].add_tag_to_all(Tag::from(leader::TAG_PROPOSER))?;
+    tracing::info!(
+        "cluster {} is the initial proposer (all 3 nodes tagged 'proposer')",
+        cluster_names[initial_proposer_idx].to_uppercase()
+    );
+
+    // Spawn cluster-aware proposer tracking
+    let slot_duration = std::time::Duration::from_millis(500);
+    let handles: Vec<Vec<_>> = clusters
+        .iter()
+        .map(|c| c.discovery_handles())
+        .collect();
+    let names: Vec<String> = cluster_names.iter().map(|n| n.to_string()).collect();
+    tokio::spawn(async move {
+        if let Err(e) =
+            leader::track_proposer_clusters(handles, names, slot_duration, 3).await
+        {
+            tracing::error!("cluster proposer tracker failed: {e}");
+        }
+    });
+
+    // Also spawn intra-cluster Raft leader tracking on each node.
+    // This tracks the Raft leader WITHIN each cluster for the "raft-leader" tag,
+    // independent of the proposer schedule.
+    for (name, cluster) in [("a", &cluster_a), ("b", &cluster_b), ("c", &cluster_c)] {
+        for (i, (net, group)) in cluster
+            .networks
+            .iter()
+            .zip(cluster.groups.iter())
+            .enumerate()
+        {
+            let discovery = net.discovery().clone();
+            let secret_key = net.local().secret_key().clone();
+            let when = group.when().clone();
+            let cluster_name = name.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = leader::track_leader_raft(discovery, secret_key, when).await {
+                    tracing::error!("raft leader tracker {cluster_name}-{i} failed: {e}");
+                }
+            });
+        }
+    }
+
+    // Give the leader tracker a moment to apply tags
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // =========================================================================
+    // Phase 5: Create tx sources and submit transactions to proposer cluster
+    // =========================================================================
+    tracing::info!("--- Phase 5: Transaction submission to proposer cluster ---");
+
     let tx_source_a = Network::new(network_id).await?;
     let tx_source_b = Network::new(network_id).await?;
 
-    // --- Set up stream producers BEFORE cross-discovery ---
-    // Producers must be created before sync so their stream IDs appear in the
-    // catalog entries that validators receive during discovery.
-    tracing::info!("creating transaction stream producers...");
+    // Set up stream producers BEFORE cross-discovery
     let mut producer_a = tx_source_a.streams().produce::<Transaction>();
     let mut producer_b = tx_source_b.streams().produce::<Transaction>();
 
-    // Cross-discover tx sources with validators (after producers exist)
-    tracing::info!("cross-discovering tx sources with validators...");
-    discover_all([
-        &tx_source_a,
-        &tx_source_b,
-        &validator0,
-        &validator1,
-        &validator2,
-    ])
-    .await?;
+    // Discover tx sources with all clusters
+    cluster_a
+        .discover_networks(&[&tx_source_a, &tx_source_b])
+        .await?;
+    cluster_b
+        .discover_networks(&[&tx_source_a, &tx_source_b])
+        .await?;
+    cluster_c
+        .discover_networks(&[&tx_source_a, &tx_source_b])
+        .await?;
+    tracing::info!("tx sources discovered by all clusters");
 
-    // All validators consume transactions from tx sources
-    tracing::info!("creating transaction consumer on validator0...");
-    let mut consumer0 = validator0.streams().consume::<Transaction>();
+    // Create consumer on the proposer cluster's first node (any node works
+    // since Raft forwards commands to the leader internally)
+    let proposer_cluster = clusters[initial_proposer_idx];
+    let mut consumer = proposer_cluster.networks[0]
+        .streams()
+        .consume::<Transaction>();
 
     // Wait for the consumer to subscribe to both tx-source producers
     tracing::info!("waiting for consumer to subscribe to tx-source producers...");
-    consumer0.when().subscribed().minimum_of(2).await;
-    tracing::info!("validator0 subscribed to both tx-source streams");
+    consumer.when().subscribed().minimum_of(2).await;
+    tracing::info!("proposer cluster subscribed to both tx-source streams");
 
-    // =========================================================================
-    // Phase 1: Submit valid transactions with varying gas prices
-    // =========================================================================
-    tracing::info!("--- Phase 1: Submitting valid transactions ---");
-
-    // Alice sends two transactions with sequential nonces
+    // Submit transactions
+    tracing::info!("submitting transactions...");
     producer_a
         .send(Transaction {
             id: 1,
@@ -200,7 +194,6 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Bob sends two transactions with sequential nonces
     producer_b
         .send(Transaction {
             id: 3,
@@ -223,180 +216,55 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Consume and add all 4 valid transactions to the mempool via Raft
-    tracing::info!("consuming transactions and adding to mempool...");
+    // Consume and add to the proposer cluster's mempool via Raft.
+    // Note: execute() works from any node -- followers forward to the Raft leader.
+    let proposer_group = &proposer_cluster.groups[0];
+    tracing::info!("consuming transactions and adding to proposer cluster's mempool...");
     for _ in 0..4 {
-        let tx = consumer0
+        let tx = consumer
             .next()
             .await
             .expect("expected transaction from stream");
-
         tracing::info!(
             id = tx.id,
             sender = tx.sender,
-            gas_limit = tx.gas_limit,
             gas_price = tx.gas_price,
-            nonce = tx.nonce,
             "received transaction"
         );
-
-        g0.execute(MempoolCommand::AddTransaction(tx)).await?;
+        proposer_group
+            .execute(MempoolCommand::AddTransaction(tx))
+            .await?;
     }
 
-    // Query pending count: should be 4
-    let result = g0
+    // Query pending count from the cluster leader
+    let result = proposer_group
         .query(MempoolQuery::PendingCount, Consistency::Strong)
         .await?;
     if let MempoolQueryResult::Count(count) = result {
-        tracing::info!("pending transactions after Phase 1: {count} (expected: 4)");
+        tracing::info!("proposer cluster pending transactions: {count} (expected: 4)");
     }
 
     // =========================================================================
-    // Phase 2: Demonstrate CheckTx validation - dedup and nonce checks
+    // Phase 6: Build a block from the proposer cluster
     // =========================================================================
-    tracing::info!("--- Phase 2: CheckTx validation ---");
-
-    // CheckTx: duplicate transaction (id=1 already in mempool)
-    let dup_check = g0
-        .query(
-            MempoolQuery::CheckTx(Transaction {
-                id: 1,
-                sender: "alice".into(),
-                payload: vec![1, 2, 3],
-                gas_limit: 21_000,
-                gas_price: 10,
-                nonce: 0,
-            }),
-            Consistency::Strong,
-        )
-        .await?;
-    if let MempoolQueryResult::CheckTx(result) = &dup_check {
-        tracing::info!(
-            valid = result.valid,
-            reason = result.reason.as_deref().unwrap_or("none"),
-            "CheckTx duplicate tx id=1"
-        );
-    }
-
-    // Submit the duplicate via AddTransaction to show it gets rejected
-    tracing::info!("submitting duplicate transaction id=1 (should be rejected)...");
-    producer_a
-        .send(Transaction {
-            id: 1,
-            sender: "alice".into(),
-            payload: vec![1, 2, 3],
-            gas_limit: 21_000,
-            gas_price: 10,
-            nonce: 0,
-        })
+    tracing::info!("--- Phase 6: Block building from proposer cluster ---");
+    proposer_group
+        .execute(MempoolCommand::BuildBlock)
         .await?;
 
-    let dup_tx = consumer0
-        .next()
-        .await
-        .expect("expected duplicate transaction from stream");
-    g0.execute(MempoolCommand::AddTransaction(dup_tx)).await?;
-
-    // CheckTx: stale nonce (alice nonce=0 already accepted)
-    let stale_check = g0
-        .query(
-            MempoolQuery::CheckTx(Transaction {
-                id: 99,
-                sender: "alice".into(),
-                payload: vec![],
-                gas_limit: 21_000,
-                gas_price: 10,
-                nonce: 0, // stale: alice already has nonce 0 and 1 pending
-            }),
-            Consistency::Strong,
-        )
-        .await?;
-    if let MempoolQueryResult::CheckTx(result) = &stale_check {
-        tracing::info!(
-            valid = result.valid,
-            reason = result.reason.as_deref().unwrap_or("none"),
-            "CheckTx stale nonce for alice (nonce=0)"
-        );
-    }
-
-    // CheckTx: gas exceeds block limit
-    let gas_check = g0
-        .query(
-            MempoolQuery::CheckTx(Transaction {
-                id: 100,
-                sender: "charlie".into(),
-                payload: vec![],
-                gas_limit: max_block_gas + 1, // exceeds max_block_gas
-                gas_price: 10,
-                nonce: 0,
-            }),
-            Consistency::Strong,
-        )
-        .await?;
-    if let MempoolQueryResult::CheckTx(result) = &gas_check {
-        tracing::info!(
-            valid = result.valid,
-            reason = result.reason.as_deref().unwrap_or("none"),
-            "CheckTx gas exceeds block limit"
-        );
-    }
-
-    // Pending count should still be 4 (duplicate was rejected)
-    let result = g0
+    let result = proposer_group
         .query(MempoolQuery::PendingCount, Consistency::Strong)
         .await?;
     if let MempoolQueryResult::Count(count) = result {
-        tracing::info!("pending transactions after Phase 2: {count} (expected: 4)");
+        tracing::info!("proposer cluster pending after block: {count} (expected: 0)");
     }
 
     // =========================================================================
-    // Phase 3: PrepareProposal - gas-aware block building
+    // Phase 7: Demonstrate intra-cluster replication and load balancing
     // =========================================================================
-    tracing::info!("--- Phase 3: PrepareProposal (BuildBlock) ---");
+    tracing::info!("--- Phase 7: Intra-cluster replication and load balancing ---");
 
-    // List pending transactions before block
-    let result = g0
-        .query(MempoolQuery::PendingTransactions(10), Consistency::Strong)
-        .await?;
-    if let MempoolQueryResult::Transactions(txs) = &result {
-        tracing::info!("pending transactions before block:");
-        for tx in txs {
-            tracing::info!(
-                "  tx {} from {} (gas: {}, gas_price: {}, nonce: {})",
-                tx.id,
-                tx.sender,
-                tx.gas_limit,
-                tx.gas_price,
-                tx.nonce
-            );
-        }
-    }
-
-    // Build a block. With max_block_gas=200,000:
-    // tx1 (21k) + tx2 (50k) + tx3 (21k) + tx4 (100k) = 192k < 200k
-    // All 4 should fit in one block.
-    tracing::info!(
-        "building block (max_block_size={}, max_block_gas={})...",
-        max_block_size,
-        max_block_gas
-    );
-    g0.execute(MempoolCommand::BuildBlock).await?;
-
-    // Pending count after block: should be 0
-    let result = g0
-        .query(MempoolQuery::PendingCount, Consistency::Strong)
-        .await?;
-    if let MempoolQueryResult::Count(count) = result {
-        tracing::info!("pending transactions after block 1: {count} (expected: 0)");
-    }
-
-    // =========================================================================
-    // Phase 4: Post-block - submit more txs and demonstrate RecheckPending
-    // =========================================================================
-    tracing::info!("--- Phase 4: RecheckPending after block commit ---");
-
-    // Submit new transactions for alice and bob (nonce 2 for both)
-    // Also submit a tx with a stale nonce that should be evicted by recheck
+    // Submit new transactions for the post-block mempool
     producer_a
         .send(Transaction {
             id: 5,
@@ -419,140 +287,117 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Consume and add to mempool
     for _ in 0..2 {
-        let tx = consumer0
+        let tx = consumer
             .next()
             .await
             .expect("expected transaction from stream");
-        tracing::info!(
-            id = tx.id,
-            sender = tx.sender,
-            nonce = tx.nonce,
-            "received post-block transaction"
-        );
-        g0.execute(MempoolCommand::AddTransaction(tx)).await?;
+        tracing::info!(id = tx.id, sender = tx.sender, "received post-block transaction");
+        proposer_group
+            .execute(MempoolCommand::AddTransaction(tx))
+            .await?;
     }
 
-    let result = g0
+    // Query the leader with Strong consistency
+    let leader_result = proposer_group
         .query(MempoolQuery::PendingCount, Consistency::Strong)
         .await?;
-    if let MempoolQueryResult::Count(count) = result {
-        tracing::info!("pending before recheck: {count} (expected: 2)");
+    if let MempoolQueryResult::Count(count) = leader_result {
+        tracing::info!("leader (Strong consistency): {count} pending (expected: 2)");
     }
 
-    // RecheckPending: re-validate all pending transactions against updated
-    // nonce state. After block 1 committed alice nonce=1 and bob nonce=1,
-    // so alice nonce=2 and bob nonce=2 are still valid.
-    tracing::info!("executing RecheckPending...");
-    g0.execute(MempoolCommand::RecheckPending).await?;
+    // Demonstrate load balancing: query a FOLLOWER node with Weak consistency.
+    // Wait for replication to catch up first.
+    let follower_idx = if proposer_cluster.leader_index() == Some(0) {
+        1
+    } else {
+        0
+    };
+    let follower_group = &proposer_cluster.groups[follower_idx];
 
-    let result = g0
-        .query(MempoolQuery::PendingCount, Consistency::Strong)
-        .await?;
-    if let MempoolQueryResult::Count(count) = result {
-        tracing::info!("pending after recheck: {count} (expected: 2, no evictions)");
-    }
+    // Wait for the follower to catch up to the leader's committed index
+    follower_group
+        .when()
+        .committed()
+        .reaches(proposer_group.committed())
+        .await;
 
-    // =========================================================================
-    // Phase 5: Verify state replication to a follower
-    // =========================================================================
-    tracing::info!("--- Phase 5: Verifying replication to follower ---");
-    g1.when().committed().reaches(g0.committed()).await;
-    let follower_result = g1
+    let follower_result = follower_group
         .query(MempoolQuery::PendingCount, Consistency::Weak)
         .await?;
     if let MempoolQueryResult::Count(count) = follower_result {
-        tracing::info!("follower g1 sees {count} pending transactions (consistent with leader)");
+        tracing::info!(
+            "follower node {follower_idx} (Weak consistency): {count} pending (consistent with leader)"
+        );
+    }
+
+    // Demonstrate command forwarding: submit a transaction via a follower node.
+    // The follower automatically forwards to the Raft leader.
+    tracing::info!("submitting transaction via follower node {follower_idx} (auto-forwarded to leader)...");
+    producer_a
+        .send(Transaction {
+            id: 7,
+            sender: "charlie".into(),
+            payload: vec![17, 18, 19],
+            gas_limit: 25_000,
+            gas_price: 30,
+            nonce: 0,
+        })
+        .await?;
+
+    let tx = consumer
+        .next()
+        .await
+        .expect("expected transaction from stream");
+    // Execute via the follower -- Raft forwards to the cluster leader
+    follower_group
+        .execute(MempoolCommand::AddTransaction(tx))
+        .await?;
+
+    let result = proposer_group
+        .query(MempoolQuery::PendingCount, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Count(count) = result {
+        tracing::info!(
+            "after follower-forwarded tx: {count} pending (expected: 3, confirms forwarding works)"
+        );
     }
 
     // =========================================================================
-    // Phase 6: Pipeline Pre-Connection for Fast BFT Rotation
+    // Phase 8: Verify cross-cluster state isolation
     // =========================================================================
-    tracing::info!("--- Phase 6: Pipeline Pre-Connection Demo ---");
-    tracing::info!(
-        "Problem: reactive tag updates take 100-400ms, too slow for 500ms slot rotation"
-    );
-    tracing::info!(
-        "Solution: deterministic schedule allows pre-tagging upcoming proposers"
-    );
+    tracing::info!("--- Phase 8: Cross-cluster state isolation ---");
+    tracing::info!("each cluster has its own GroupKey = independent Raft group = isolated mempool");
 
-    // Create a ValidatorSchedule from the 3 validator PeerIds with equal
-    // voting power and 500ms slots
-    let slot_duration = std::time::Duration::from_millis(500);
-    let validator_set = vec![
-        (validator0.local().id(), 1),
-        (validator1.local().id(), 1),
-        (validator2.local().id(), 1),
-    ];
-
-    let schedule = ValidatorSchedule::new(validator_set.clone(), slot_duration);
-
-    // Show the pre-computed schedule for the next 10 slots
-    tracing::info!("pre-computed proposer schedule (next 10 slots):");
-    let upcoming = schedule.upcoming_proposers(10);
-    for (slot, proposer) in &upcoming {
-        // Determine which validator index this proposer is
-        let validator_idx = if *proposer == validator0.local().id() {
-            0
-        } else if *proposer == validator1.local().id() {
-            1
-        } else {
-            2
-        };
-        tracing::info!("  slot {slot}: validator{validator_idx} ({proposer})");
+    // Query cluster B's mempool -- should be empty since only cluster A received transactions
+    let cluster_b_result = cluster_b.groups[0]
+        .query(MempoolQuery::PendingCount, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Count(count) = cluster_b_result {
+        tracing::info!(
+            "cluster B pending: {count} (expected: 0, isolated from cluster A)"
+        );
     }
 
-    // Spawn schedule-aware leader trackers on each validator.
-    // Each validator independently computes the same schedule and pre-tags itself.
-    let schedule0 = ValidatorSchedule::new(validator_set.clone(), slot_duration);
-    tokio::spawn({
-        let discovery = validator0.discovery().clone();
-        let secret_key = validator0.local().secret_key().clone();
-        let local_id = validator0.local().id();
-        async move {
-            if let Err(e) =
-                leader::track_leader_scheduled(schedule0, discovery, secret_key, local_id).await
-            {
-                tracing::error!("scheduled tracker 0 failed: {e}");
-            }
-        }
-    });
+    let cluster_c_result = cluster_c.groups[0]
+        .query(MempoolQuery::PendingCount, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Count(count) = cluster_c_result {
+        tracing::info!(
+            "cluster C pending: {count} (expected: 0, isolated from cluster A)"
+        );
+    }
 
-    let schedule1 = ValidatorSchedule::new(validator_set.clone(), slot_duration);
-    tokio::spawn({
-        let discovery = validator1.discovery().clone();
-        let secret_key = validator1.local().secret_key().clone();
-        let local_id = validator1.local().id();
-        async move {
-            if let Err(e) =
-                leader::track_leader_scheduled(schedule1, discovery, secret_key, local_id).await
-            {
-                tracing::error!("scheduled tracker 1 failed: {e}");
-            }
-        }
-    });
+    // =========================================================================
+    // Phase 9: Pipeline pre-connection with cluster-level tagging
+    // =========================================================================
+    tracing::info!("--- Phase 9: Pipeline pre-connection with cluster-level tags ---");
+    tracing::info!(
+        "waiting for 2 slot rotations to observe cluster-level tag pipeline..."
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
-    let schedule2 = ValidatorSchedule::new(validator_set, slot_duration);
-    tokio::spawn({
-        let discovery = validator2.discovery().clone();
-        let secret_key = validator2.local().secret_key().clone();
-        let local_id = validator2.local().id();
-        async move {
-            if let Err(e) =
-                leader::track_leader_scheduled(schedule2, discovery, secret_key, local_id).await
-            {
-                tracing::error!("scheduled tracker 2 failed: {e}");
-            }
-        }
-    });
-
-    // Wait for 3 slot rotations (1.5s) to observe pre-tagging in action
-    tracing::info!("waiting for 3 slot rotations (1.5s) to observe pipeline pre-tagging...");
-    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
-
-    // Verify tags: show which validators currently have proposer-related tags
-    tracing::info!("current proposer tags after pipeline pre-connection:");
+    // Verify tags across all clusters
     let tag_proposer = Tag::from(leader::TAG_PROPOSER);
     let tag_next = Tag::from(leader::TAG_PROPOSER_NEXT);
     let tag_soon = Tag::from(leader::TAG_PROPOSER_SOON);
@@ -561,63 +406,53 @@ async fn main() -> anyhow::Result<()> {
         (tag_next, "proposer-next"),
         (tag_soon, "proposer-soon"),
     ];
-    for (i, validator) in [&validator0, &validator1, &validator2]
-        .iter()
-        .enumerate()
+
+    for (cluster_name, cluster) in
+        [("A", &cluster_a), ("B", &cluster_b), ("C", &cluster_c)]
     {
-        let me: PeerEntry = validator.discovery().me().into_unsigned();
-        let tags: Vec<&str> = tag_labels
-            .iter()
-            .filter(|(t, _)| me.tags().contains(t))
-            .map(|(_, label)| *label)
-            .collect();
-        if !tags.is_empty() {
-            tracing::info!("  validator{i}: {}", tags.join(", "));
+        for (node_idx, net) in cluster.networks.iter().enumerate() {
+            let me: PeerEntry = net.discovery().me().into_unsigned();
+            let tags: Vec<&str> = tag_labels
+                .iter()
+                .filter(|(t, _)| me.tags().contains(t))
+                .map(|(_, label)| *label)
+                .collect();
+            if !tags.is_empty() {
+                tracing::info!(
+                    "  cluster {cluster_name} node {node_idx}: {}",
+                    tags.join(", ")
+                );
+            }
         }
     }
 
-    // Demonstrate how tx-source consumers would use broader predicates to
-    // pre-connect to current + upcoming proposers
-    tracing::info!("pipeline subscribe_if predicate example:");
-    tracing::info!("  consumers match on 'proposer' OR 'proposer-next' OR 'proposer-soon'");
-    tracing::info!(
-        "  this gives up to 1000ms lead time (2 slots) for stream pre-warming"
-    );
-
-    let proposer_tag = Tag::from(leader::TAG_PROPOSER);
-    let next_tag = Tag::from(leader::TAG_PROPOSER_NEXT);
-    let soon_tag = Tag::from(leader::TAG_PROPOSER_SOON);
+    // Demonstrate how tx-source consumers use pipeline predicates
+    // that match any node in any proposer-tagged cluster
+    let proposer_tag_clone = Tag::from(leader::TAG_PROPOSER);
+    let next_tag_clone = Tag::from(leader::TAG_PROPOSER_NEXT);
+    let soon_tag_clone = Tag::from(leader::TAG_PROPOSER_SOON);
     let _pipeline_consumer = tx_source_a
         .streams()
         .consumer::<Transaction>()
         .subscribe_if(move |peer: &PeerEntry| {
-            peer.tags().contains(&proposer_tag)
-                || peer.tags().contains(&next_tag)
-                || peer.tags().contains(&soon_tag)
+            peer.tags().contains(&proposer_tag_clone)
+                || peer.tags().contains(&next_tag_clone)
+                || peer.tags().contains(&soon_tag_clone)
         })
         .build();
-
-    tracing::info!("pipeline consumer created with 3-tier proposer predicate");
+    tracing::info!("pipeline consumer created with cluster-aware 3-tier proposer predicate");
     tracing::info!(
-        "benefit: by the time a validator's slot starts, \
-         stream connections are already established"
+        "benefit: all 3 nodes in the proposer cluster are tagged, so streams survive \
+         intra-cluster Raft failover without reconnection"
     );
 
-    tracing::info!("cometbft mempool example complete");
-    Ok(())
-}
+    tracing::info!("--- Demo complete ---");
+    tracing::info!("summary:");
+    tracing::info!("  - 3 validator clusters x 3 nodes = 9 total Mosaik nodes");
+    tracing::info!("  - each cluster: independent Raft group with replicated mempool");
+    tracing::info!("  - intra-cluster: failover via Raft, load balancing via Weak queries");
+    tracing::info!("  - inter-cluster: proposer schedule with pipeline pre-connection");
+    tracing::info!("  - stream stability: all cluster nodes share tags, surviving failover");
 
-/// Utility: cross-discover all networks with each other.
-async fn discover_all(
-    networks: impl IntoIterator<Item = &Network>,
-) -> anyhow::Result<()> {
-    let networks = networks.into_iter().collect::<Vec<_>>();
-    for (i, net_i) in networks.iter().enumerate() {
-        for (j, net_j) in networks.iter().enumerate() {
-            if i != j {
-                net_i.discovery().sync_with(net_j.local().addr()).await?;
-            }
-        }
-    }
     Ok(())
 }
