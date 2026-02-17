@@ -1,5 +1,5 @@
 use {
-    crate::types::{CheckTxResult, ProposedBlock, Transaction},
+    crate::types::{CheckTxResult, ProposedBlock, SettlementEvent, Transaction},
     mosaik::{groups::StateMachine, primitives::UniqueId, unique_id},
     serde::{Deserialize, Serialize},
     std::collections::{BTreeMap, HashSet},
@@ -23,10 +23,23 @@ pub enum MempoolCommand {
     /// RecheckTx: after a block is committed, re-validate remaining pending
     /// transactions against the updated nonce state. Evicts transactions with
     /// stale nonces (already consumed by included transactions).
+    ///
+    /// Under source-retains-ownership, RecheckPending serves as a safety net
+    /// for the case where the SAME cluster stays proposer across consecutive
+    /// blocks. In the normal rotation case (proposer changes), the new proposer
+    /// starts with an empty mempool and sources re-submit their unincluded
+    /// transactions, so no recheck is needed.
     RecheckPending,
 
     /// Remove specific transactions by ID.
     ClearPending(Vec<u64>),
+
+    /// Reset seen_txs deduplication set. Used when a cluster becomes the new
+    /// proposer to accept re-submitted transactions from sources. Under
+    /// source-retains-ownership, sources re-produce their unincluded txs to
+    /// the new proposer, which must accept them despite them having been seen
+    /// by a previous proposer cluster.
+    ClearSeen,
 }
 
 /// Queries against the mempool state machine.
@@ -37,6 +50,8 @@ pub enum MempoolQuery {
     /// CheckTx: validate a transaction without adding it to the mempool.
     /// Returns CheckTxResult indicating validity.
     CheckTx(Transaction),
+    /// Returns the most recent SettlementEvent (included tx IDs from last BuildBlock).
+    LastSettlement,
 }
 
 /// Results returned from mempool queries.
@@ -46,6 +61,7 @@ pub enum MempoolQueryResult {
     Transactions(Vec<Transaction>),
     Block(ProposedBlock),
     CheckTx(CheckTxResult),
+    Settlement(Option<SettlementEvent>),
 }
 
 /// The replicated mempool state machine.
@@ -58,7 +74,9 @@ pub enum MempoolQueryResult {
 pub struct MempoolStateMachine {
     /// Pending transactions in FIFO order (arrival time ordering).
     pending: Vec<Transaction>,
-    /// Seen transaction IDs for deduplication.
+    /// Seen transaction IDs for deduplication. Scoped per proposer tenure:
+    /// cleared when a new cluster becomes proposer via ClearSeen, so that
+    /// re-submitted transactions from sources are accepted.
     seen_txs: HashSet<u64>,
     /// Tracks the last committed nonce per sender for ordering validation.
     nonce_tracker: BTreeMap<String, u64>,
@@ -68,6 +86,9 @@ pub struct MempoolStateMachine {
     max_block_gas: u64,
     /// Current block height.
     block_height: u64,
+    /// Most recent settlement event (included tx IDs from last BuildBlock).
+    /// Stored so it can be queried and published on a Mosaik stream.
+    last_settlement: Option<SettlementEvent>,
 }
 
 impl MempoolStateMachine {
@@ -79,6 +100,7 @@ impl MempoolStateMachine {
             max_block_size,
             max_block_gas,
             block_height: 0,
+            last_settlement: None,
         }
     }
 
@@ -147,6 +169,7 @@ impl StateMachine for MempoolStateMachine {
         self.seen_txs.clear();
         self.nonce_tracker.clear();
         self.block_height = 0;
+        self.last_settlement = None;
     }
 
     fn apply(&mut self, command: Self::Command) {
@@ -212,6 +235,14 @@ impl StateMachine for MempoolStateMachine {
                 }
 
                 self.block_height += 1;
+
+                // Store SettlementEvent so sources can confirm inclusion
+                let included_tx_ids: Vec<u64> = block_txs.iter().map(|tx| tx.id).collect();
+                self.last_settlement = Some(SettlementEvent {
+                    block_height: self.block_height,
+                    included_tx_ids,
+                });
+
                 tracing::info!(
                     height = self.block_height,
                     tx_count = block_txs.len(),
@@ -225,6 +256,11 @@ impl StateMachine for MempoolStateMachine {
             MempoolCommand::RecheckPending => {
                 // RecheckTx: re-validate remaining mempool transactions after
                 // a block commit. Remove transactions with stale nonces.
+                //
+                // Under source-retains-ownership, this is a safety net for the
+                // case where the same cluster stays proposer. In the normal
+                // rotation case, the new proposer starts fresh and sources
+                // re-submit, so no recheck is needed.
                 let before = self.pending.len();
                 self.pending.retain(|tx| {
                     let expected = self
@@ -253,6 +289,15 @@ impl StateMachine for MempoolStateMachine {
             MempoolCommand::ClearPending(ids) => {
                 self.pending.retain(|tx| !ids.contains(&tx.id));
             }
+
+            MempoolCommand::ClearSeen => {
+                let count = self.seen_txs.len();
+                self.seen_txs.clear();
+                tracing::info!(
+                    cleared = count,
+                    "ClearSeen: reset deduplication set for new proposer tenure"
+                );
+            }
         }
     }
 
@@ -264,6 +309,9 @@ impl StateMachine for MempoolStateMachine {
                 MempoolQueryResult::Transactions(txs)
             }
             MempoolQuery::CheckTx(tx) => MempoolQueryResult::CheckTx(self.check_tx(&tx)),
+            MempoolQuery::LastSettlement => {
+                MempoolQueryResult::Settlement(self.last_settlement.clone())
+            }
         }
     }
 }

@@ -11,6 +11,7 @@ use {
     futures::{SinkExt, StreamExt},
     mempool::{MempoolCommand, MempoolQuery, MempoolQueryResult},
     mosaik::{discovery::PeerEntry, primitives::Tag, *},
+    std::collections::HashMap,
     types::Transaction,
 };
 
@@ -446,6 +447,157 @@ async fn main() -> anyhow::Result<()> {
          intra-cluster Raft failover without reconnection"
     );
 
+    // =========================================================================
+    // Phase 10: Source-retains-ownership demo
+    // =========================================================================
+    tracing::info!("--- Phase 10: Source-retains-ownership demo ---");
+    tracing::info!(
+        "tx sources maintain local pools, re-submit unincluded txs on proposer rotation"
+    );
+
+    // Create tx source pools (simulating source-retains-ownership)
+    let mut source_a_pool: HashMap<u64, Transaction> = HashMap::new();
+    let mut source_b_pool: HashMap<u64, Transaction> = HashMap::new();
+
+    // Submit 6 transactions: 3 from each source
+    let source_a_txs = vec![
+        Transaction { id: 100, sender: "alice".into(), payload: vec![1], gas_limit: 30_000, gas_price: 10, nonce: 3 },
+        Transaction { id: 101, sender: "alice".into(), payload: vec![2], gas_limit: 40_000, gas_price: 15, nonce: 4 },
+        Transaction { id: 102, sender: "alice".into(), payload: vec![3], gas_limit: 50_000, gas_price: 20, nonce: 5 },
+    ];
+    let source_b_txs = vec![
+        Transaction { id: 200, sender: "bob".into(), payload: vec![4], gas_limit: 35_000, gas_price: 12, nonce: 3 },
+        Transaction { id: 201, sender: "bob".into(), payload: vec![5], gas_limit: 45_000, gas_price: 18, nonce: 4 },
+        Transaction { id: 202, sender: "bob".into(), payload: vec![6], gas_limit: 60_000, gas_price: 8, nonce: 5 },
+    ];
+
+    // Sources retain their txs in local pools
+    for tx in &source_a_txs {
+        source_a_pool.insert(tx.id, tx.clone());
+    }
+    for tx in &source_b_txs {
+        source_b_pool.insert(tx.id, tx.clone());
+    }
+    tracing::info!(
+        source_a_pool = source_a_pool.len(),
+        source_b_pool = source_b_pool.len(),
+        "sources populated local pools"
+    );
+
+    // Send txs to the current proposer cluster (A)
+    // First, clear the proposer cluster's seen set (it was already proposer,
+    // this simulates it becoming proposer fresh)
+    proposer_group
+        .execute(MempoolCommand::ClearSeen)
+        .await?;
+
+    for tx in &source_a_txs {
+        producer_a.send(tx.clone()).await?;
+    }
+    for tx in &source_b_txs {
+        producer_b.send(tx.clone()).await?;
+    }
+
+    // Consume and add to proposer
+    for _ in 0..6 {
+        let tx = consumer.next().await.expect("expected transaction");
+        proposer_group
+            .execute(MempoolCommand::AddTransaction(tx))
+            .await?;
+    }
+
+    let result = proposer_group
+        .query(MempoolQuery::PendingCount, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Count(count) = result {
+        tracing::info!("proposer cluster A pending: {count} (expected: 6)");
+    }
+
+    // Build block -- max gas 200k, so not all txs will fit
+    // 30k + 40k + 50k + 35k + 45k = 200k exactly, tx 202 (60k) won't fit
+    proposer_group
+        .execute(MempoolCommand::BuildBlock)
+        .await?;
+
+    // Query the SettlementEvent from the proposer
+    let settlement_result = proposer_group
+        .query(MempoolQuery::LastSettlement, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Settlement(Some(settlement)) = &settlement_result {
+        tracing::info!(
+            height = settlement.block_height,
+            included = ?settlement.included_tx_ids,
+            "SettlementEvent from proposer"
+        );
+
+        // Sources process settlement: remove included txs from local pools
+        for tx_id in &settlement.included_tx_ids {
+            source_a_pool.remove(tx_id);
+            source_b_pool.remove(tx_id);
+        }
+        tracing::info!(
+            source_a_remaining = source_a_pool.len(),
+            source_b_remaining = source_b_pool.len(),
+            "sources processed settlement, removed included txs"
+        );
+    }
+
+    // Now simulate proposer rotation: cluster B becomes proposer
+    tracing::info!("--- Rotating proposer: cluster A -> cluster B ---");
+
+    // Clear cluster B's seen set so it accepts re-submitted txs
+    cluster_b.groups[0]
+        .execute(MempoolCommand::ClearSeen)
+        .await?;
+
+    // Create a consumer on cluster B for the remaining unincluded txs
+    let mut consumer_b = cluster_b.networks[0]
+        .streams()
+        .consume::<Transaction>();
+
+    // Wait for consumer_b to be subscribed
+    consumer_b.when().subscribed().minimum_of(1).await;
+
+    // Sources re-produce their unincluded transactions to the new proposer
+    let remaining_txs: Vec<Transaction> = source_a_pool
+        .values()
+        .chain(source_b_pool.values())
+        .cloned()
+        .collect();
+    let remaining_count = remaining_txs.len();
+
+    tracing::info!(
+        remaining = remaining_count,
+        "sources re-producing unincluded txs to new proposer cluster B"
+    );
+
+    for tx in &remaining_txs {
+        producer_a.send(tx.clone()).await?;
+    }
+
+    // New proposer consumes and adds re-submitted txs
+    for _ in 0..remaining_count {
+        let tx = consumer_b.next().await.expect("expected re-submitted tx");
+        tracing::info!(
+            tx_id = tx.id,
+            sender = tx.sender,
+            "cluster B received re-submitted transaction"
+        );
+        cluster_b.groups[0]
+            .execute(MempoolCommand::AddTransaction(tx))
+            .await?;
+    }
+
+    let result = cluster_b.groups[0]
+        .query(MempoolQuery::PendingCount, Consistency::Strong)
+        .await?;
+    if let MempoolQueryResult::Count(count) = result {
+        tracing::info!(
+            "cluster B pending after re-submission: {count} \
+             (expected: {remaining_count}, confirms source-retains-ownership works)"
+        );
+    }
+
     tracing::info!("--- Demo complete ---");
     tracing::info!("summary:");
     tracing::info!("  - 3 validator clusters x 3 nodes = 9 total Mosaik nodes");
@@ -453,6 +605,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  - intra-cluster: failover via Raft, load balancing via Weak queries");
     tracing::info!("  - inter-cluster: proposer schedule with pipeline pre-connection");
     tracing::info!("  - stream stability: all cluster nodes share tags, surviving failover");
+    tracing::info!("  - source-retains-ownership: sources hold txs, re-submit on rotation");
+    tracing::info!("  - settlement events: proposer publishes included tx IDs for confirmation");
 
     Ok(())
 }

@@ -46,3 +46,12 @@ pub struct CheckTxResult {
     pub valid: bool,
     pub reason: Option<String>,
 }
+
+/// Reverse inclusion confirmation stream: published by the proposer after
+/// BuildBlock so that transaction sources can confirm which transactions
+/// were included and remove them from their local pools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementEvent {
+    pub block_height: u64,
+    pub included_tx_ids: Vec<u64>,
+}
